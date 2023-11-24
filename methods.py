@@ -8,14 +8,17 @@ from utils import (
     predict_from_input_probs,
 )
 from matplotlib import pyplot as plt
-from tqdm import tqdm
-import pandas as pd
+from enum import Enum
+class InterventionType(Enum):
+    DROP_CONNECTION_FROM_LAST_TOKEN = 0
+    DROP_CONNECTION_TO_ALL_TOKENS = 1
 
 
 def _split_heads(tensor, num_heads, attn_head_size):
     new_shape = tensor.size()[:-1] + (num_heads, attn_head_size)
     tensor = tensor.view(new_shape)
     return tensor.permute(1, 0, 2)  # (head, seq_length, head_features)
+
 
 def _merge_heads(tensor, model):
     num_heads = model.config.n_head
@@ -76,8 +79,6 @@ def set_act_get_hooks(model, tok_index, attn=False, attn_out=False, mlp=False, m
             hooks.append(model.transformer.h[i].mlp.register_forward_hook(get_activation("m_out_" + str(i))))
             
     return hooks
-
-
 # To block attention edges, we zero-out entries in the attention mask.
 # To do this, we add a wrapper around the attention module, because 
 # the mask is passed as an additional argument, which could not be fetched 
@@ -159,7 +160,6 @@ def set_get_attn_proj_hooks(model, tok_index):
 
 
 def set_block_mlp_hooks(model, values_per_layer, coef_value=0):
-    
     def change_values(values, coef_val):
         def hook(module, input, output):
             output[:, :, values] = coef_val
@@ -245,16 +245,17 @@ def set_hs_patch_hooks(model, hs_patch_config, patch_input=False):
             ))
 
     return hooks
-    
-
 # Always remove your hooks, otherwise things will get messy.
+
 def remove_hooks(hooks):
     for hook in hooks:
         hook.remove()
 
+
 def remove_wrapper(model, hooks):
     for i, hook in hooks:
         model.transformer.h[i].attn.forward = hook
+
 
 def trace_with_attn_block(
     model,
@@ -297,20 +298,21 @@ def trace_with_attn_block_probs(
     return probs
 
 
-def trace_with_proj(model, inp):
+def trace_with_proj(model, inp, true_answer_tokens = None, k=None):
     with torch.no_grad():
         # set hooks
         hooks = set_proj_hooks(model)
         
         # get prediction
-        answer_t, base_score = [d[0] for d in predict_from_input(model, inp)]
-        
+        answer_t, base_score = [d[0] for d in predict_from_input(model, inp, true_answer_tokens, k)]
+
         # remove hooks
         remove_hooks(hooks)
         
     projs = model.projs_
     
     return answer_t, base_score, projs
+
 
 def trace_with_proj_probs(model, inp):
     with torch.no_grad():
@@ -327,13 +329,21 @@ def trace_with_proj_probs(model, inp):
     
     return probs, projs
 
+
 def intervene_on_info_flow(
-    mt, prompt, source=None, kind="single", window=10, positions=None
+    mt, prompt, correct_answer = None, source=None, kind="single", window=10, positions=None, intervention_type = InterventionType.DROP_CONNECTION_FROM_LAST_TOKEN
 ):
     inp = make_inputs(mt.tokenizer, [prompt])
-    answer_t, base_score, projs = trace_with_proj(mt.model, inp)
-    [answer] = decode_tokens(mt.tokenizer, [answer_t])
-    
+    answer_tokens = None
+    if correct_answer is not None:
+            answer_tokens = make_inputs(mt.tokenizer, [correct_answer])
+    answer_t, base_score, projs = trace_with_proj(mt.model, inp, answer_tokens)
+
+    if isinstance(answer_t.item(), list):
+        answer = decode_tokens(mt.tokenizer, answer_t)
+    else:
+        [answer] = decode_tokens(mt.tokenizer, [answer_t])
+        
     ntoks = inp["input_ids"].shape[1]
     if source is None:
         source_ = ntoks-1
@@ -348,20 +358,18 @@ def intervene_on_info_flow(
         row = []
         for layer in range(mt.num_layers):
             if kind == "single":
-                block_config = {layer: [(source_, tnum)]}
+                layer_list = [layer]
+                block_config = get_block_config(layer_list, intervention_type, source_, tnum, ntoks)
                 r = trace_with_attn_block(
                     mt.model, inp, block_config, answer_t
                 )
             elif kind == "window":
-                layerlist = [
+                layer_list = [
                     l for l in range(
                         max(0, layer - window // 2), min(mt.num_layers, layer - (-window // 2))
                     )
                 ]
-                block_config = {
-                    l: [(source_, tnum)]
-                    for l in layerlist
-                }
+                block_config = get_block_config(layer_list, intervention_type, source_, tnum, ntoks)
                 r = trace_with_attn_block(
                     mt.model, inp, block_config, answer_t
                 )
@@ -392,12 +400,21 @@ def intervene_on_info_flow(
         kind="",
     )
 
-def plot_info_flow(
-    mt,
-    prompt,
-    source=None,
-    kind="single",
-    window=10,
+
+def get_block_config(layer_list, intervention_type, source, tnum, num_of_tokens):
+    if intervention_type == InterventionType.DROP_CONNECTION_FROM_LAST_TOKEN:
+        block_config = { l: [(source, tnum)] for l in layer_list}
+    elif intervention_type == InterventionType.DROP_CONNECTION_TO_ALL_TOKENS:
+        block_config = { l: [(s, tnum) for s in range(num_of_tokens)] for l in layer_list}
+    else:
+        raise NotImplementedError(f"{intervention_type.name} not implemented yet")
+    return block_config
+
+
+def plot_info_flow_given_result(
+    result,
+    correct_answer = None,
+    num_layers=48,
     set_lims=True,
     show_proj=True,
     savepdf=None,
@@ -413,7 +430,8 @@ def plot_info_flow(
     labels[source] = labels[source] + "*"
 
     size_height = len(labels) * 0.3
-    fig, ax = plt.subplots(figsize=(7, size_height), dpi=150)
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(7, size_height), dpi=150)
     if set_lims:
         h = ax.pcolor(
             differences,
@@ -433,7 +451,7 @@ def plot_info_flow(
     ax.set_yticklabels(labels)
 
     if show_proj:
-        for x in range(mt.num_layers):
+        for x in range(num_layers):
             plt.text(
                 x + 0.5, source + 0.5, 
                 f'{result["source_preds"][x]} {round(100.0 * result["source_probs"][x], 1)}',
@@ -453,8 +471,22 @@ def plot_info_flow(
         plt.close()
     else:
         plt.show()
+
+
+def plot_info_flow(
+    mt,
+    prompt,
+    source=None,
+    kind="single",
+    window=10,
+    set_lims=True,
+    show_proj=True,
+    savepdf=None,
+    ):
     
-    return result
+    result = intervene_on_info_flow(mt, prompt, source, kind, window)
+    plot_info_flow_given_result(result, set_lims, show_proj, savepdf)
+
 
 def next_token(mt, prompt):
     inp = make_inputs(mt.tokenizer, [prompt])

@@ -55,6 +55,7 @@ class ModelAndTokenizer:
     ]
     self.num_layers = len(self.layer_names)
 
+
   def __repr__(self):
     """String representation of this class.
     """
@@ -111,11 +112,25 @@ def find_token_range(tokenizer, token_array, substring):
   return (tok_start, tok_end)
 
 
-def predict_from_input(model, inp):
+def predict_from_input(model, inp, true_answer_tokens = None, k = None):
+  if k is not None and true_answer_tokens is not None:
+    raise AttributeError("Ambiguity: choose either true_answer_tokens or k")
   out = model(**inp)["logits"]
   probs = torch.softmax(out[:, -1], dim=1)
-  p, preds = torch.max(probs, dim=1)
+  if k is None and true_answer_tokens is None:
+    p, preds = torch.max(probs, dim=1)
+  elif k is not None:
+    p, preds = torch.topk(probs, k, dim=1)
+  else:
+    ans_token_ids = true_answer_tokens['input_ids']
+    preds = [ans_token_ids[0][0]]
+    p = [probs[0][ans_token_ids[0][0]]]
   return preds, p
+
+
+def next_token_probs(model, inp):
+  out = model(**inp)["logits"]
+  return torch.softmax(out[:, -1], dim=1)
 
 
 def predict_from_input_probs(model, inp):
@@ -123,11 +138,13 @@ def predict_from_input_probs(model, inp):
   probs = torch.softmax(out[:, -1], dim=1)
   return probs
 
+
 def prediction(model, inp):
   out = model(**inp)["logits"]
   probs = torch.softmax(out[:, -1], dim=1)
   p, preds = torch.max(probs, dim=1)
   return probs, preds, p
+
 
 def set_requires_grad(requires_grad, *models):
   for model in models:

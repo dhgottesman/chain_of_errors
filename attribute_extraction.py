@@ -165,5 +165,5 @@ if __name__ == "__main__":
     # subject_only_cache = build_subject_cache(mt, df, prompt_subject)
     subject_prompt_results = attribute_extraction(df)
     # subject_only_results = attribute_extraction(df, subject_only_cache, prompt_subject)
-    results.to_json("/home/gamir/DER-Roei/dhgottesman/DFR/mistakes_attribute_extraction_rate.json")
-    print(results)
+    subject_prompt_results.to_json("/home/gamir/DER-Roei/dhgottesman/DFR/mistakes_attribute_extraction_rate.json")
+    print(subject_prompt_results)
